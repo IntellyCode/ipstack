@@ -1081,3 +1081,46 @@ pub(crate) fn create_raw_packet(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+
+    #[tokio::test]
+    async fn extract_reserves_before_consuming() {
+        let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let read_notify = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
+
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.change_state(TcpState::Established);
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
+
+        // first extract fills the single channel slot and advances ack over the first chunk
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+
+        // channel is full: extract leaves the remaining data in the map and does not advance ack
+        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+        assert_eq!(tcb.get_unordered_packets_total_len(), 500);
+
+        // draining the reader frees a slot, and the next extract flushes the tail
+        let first = data_rx.recv().await.unwrap();
+        assert_eq!(first.len(), 1000);
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+    }
+}
